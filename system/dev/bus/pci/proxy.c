@@ -261,6 +261,23 @@ static zx_status_t pci_op_map_interrupt(void* ctx, int which_irq, zx_handle_t* o
     return st;
 }
 
+static zx_status_t pci_op_get_bti(void* ctx, zx_handle_t* out_handle) {
+    if (!out_handle) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    kpci_device_t* dev = ctx;
+    pci_msg_t req = {
+    };
+    pci_msg_t resp = {};
+    zx_handle_t handle;
+    zx_status_t st = pci_rpc_request(dev, PCI_OP_GET_BTI, &handle, &req, &resp);
+    if (st == ZX_OK) {
+        *out_handle = handle;
+    }
+    return st;
+}
+
 static zx_status_t pci_op_query_irq_mode(void* ctx,
                                          zx_pci_irq_mode_t mode,
                                          uint32_t* out_max_irqs) {
@@ -329,6 +346,7 @@ static zx_status_t pci_op_get_auxdata(void* ctx, const char* args, void* data,
 
 static pci_protocol_ops_t _pci_protocol = {
     .enable_bus_master = pci_op_enable_bus_master,
+    .get_bti = pci_op_get_bti,
     .reset_device = pci_op_reset_device,
     .get_bar = pci_op_get_bar,
     .map_bar = pci_op_map_bar,
