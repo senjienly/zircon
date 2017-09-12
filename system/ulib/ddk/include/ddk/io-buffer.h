@@ -9,6 +9,7 @@
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -77,6 +78,9 @@ zx_status_t io_buffer_physmap(io_buffer_t* buffer);
 // Releases an io_buffer
 void io_buffer_release(io_buffer_t* buffer);
 
+// Set the BTI used by io_buffers for getting physical addresses
+void io_buffer_set_default_bti(zx_handle_t bti);
+
 static inline bool io_buffer_is_valid(io_buffer_t* buffer) {
     return (buffer->vmo_handle != ZX_HANDLE_INVALID);
 }
@@ -93,8 +97,37 @@ static inline zx_paddr_t io_buffer_phys(io_buffer_t* buffer) {
 static inline zx_status_t io_buffer_physmap_range(io_buffer_t* buffer, zx_off_t offset,
                                                   size_t length, size_t phys_count,
                                                   zx_paddr_t* physmap) {
-    return zx_vmo_op_range(buffer->vmo_handle, ZX_VMO_OP_LOOKUP, offset, length,
-                           physmap, phys_count * sizeof(*physmap));
+    // TODO(teisenbe): We need to figure out how to integrate lifetime
+    // management of this pin into the io_buffer API...
+    extern zx_handle_t io_default_bti;
+    if (io_default_bti == ZX_HANDLE_INVALID) {
+        return zx_vmo_op_range(buffer->vmo_handle, ZX_VMO_OP_LOOKUP, offset, length,
+                               physmap, phys_count * sizeof(*physmap));
+    } else {
+        size_t actual_entries;
+        const size_t sub_offset = offset & (PAGE_SIZE - 1);
+        const size_t pin_offset = offset - sub_offset;
+        const size_t pin_length = (length + sub_offset + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        zx_status_t status = zx_bti_pin(io_default_bti, buffer->vmo_handle, pin_offset,
+                                        pin_length,
+                                        ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                                        physmap, phys_count, &actual_entries);
+        if (status != ZX_OK) {
+            return status;
+        }
+        // We should remove this assert by tracking the length of this array
+        // explicitly in buffer.
+        if (actual_entries != phys_count) {
+            // TODO(teisenbe): Support non-4K min contig
+            ZX_DEBUG_ASSERT(phys_count == pin_length / PAGE_SIZE);
+            ZX_DEBUG_ASSERT(actual_entries == 1);
+            for (size_t i = 1; i < phys_count; ++i) {
+                physmap[i] = physmap[i - 1] + PAGE_SIZE;
+            }
+        }
+        physmap[0] += sub_offset;
+        return ZX_OK;
+    }
 }
 
 // Returns the buffer size available after the given offset, relative to the

@@ -5,11 +5,14 @@
 #include <ddk/io-buffer.h>
 #include <ddk/debug.h>
 #include <ddk/driver.h>
+#include <zircon/assert.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+zx_handle_t io_default_bti = ZX_HANDLE_INVALID;
 
 // Returns true if a buffer with these parameters was allocated using
 // zx_vmo_create_contiguous.  This is primarily important so we know whether we
@@ -44,13 +47,23 @@ static zx_status_t io_buffer_init_common(io_buffer_t* buffer, zx_handle_t vmo_ha
         return status;
     }
 
-    zx_paddr_t phys = IO_BUFFER_INVALID_PHYS;
     // For contiguous buffers, pre-lookup the physical mapping so
     // io_buffer_phys() works.  For non-contiguous buffers, io_buffer_physmap()
     // will need to be called.
+    zx_paddr_t phys = IO_BUFFER_INVALID_PHYS;
     if (flags & IO_BUFFER_CONTIG) {
-        size_t lookup_size = size < PAGE_SIZE ? size : PAGE_SIZE;
-        status = zx_vmo_op_range(vmo_handle, ZX_VMO_OP_LOOKUP, 0, lookup_size, &phys, sizeof(phys));
+        if (io_default_bti == ZX_HANDLE_INVALID) {
+            size_t lookup_size = size < PAGE_SIZE ? size : PAGE_SIZE;
+            status = zx_vmo_op_range(vmo_handle, ZX_VMO_OP_LOOKUP, 0, lookup_size, &phys, sizeof(phys));
+        } else {
+            size_t actual_extents;
+            status = zx_bti_pin(io_default_bti, vmo_handle, 0, ROUNDUP(size, PAGE_SIZE),
+                                ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                                &phys, 1, &actual_extents);
+            // We should remove this assert by tracking the length of this array
+            // explicitly in buffer.
+            ZX_DEBUG_ASSERT(status != ZX_OK || actual_extents == 1);
+        }
         if (status != ZX_OK) {
             zxlogf(ERROR, "io_buffer: zx_vmo_op_range failed %d size: %zu\n", status, size);
             zx_vmar_unmap(zx_vmar_root_self(), virt, size);
@@ -164,9 +177,18 @@ zx_status_t io_buffer_init_physical(io_buffer_t* buffer, zx_paddr_t addr, size_t
 
 void io_buffer_release(io_buffer_t* buffer) {
     if (buffer->vmo_handle != ZX_HANDLE_INVALID) {
+        if (io_default_bti != ZX_HANDLE_INVALID && buffer->phys != UINT64_MAX) {
+            zx_status_t status = zx_bti_unpin(io_default_bti, buffer->phys);
+            ZX_DEBUG_ASSERT(status == ZX_OK);
+        }
+
         zx_vmar_unmap(zx_vmar_root_self(), (uintptr_t)buffer->virt, buffer->size);
         zx_handle_close(buffer->vmo_handle);
         buffer->vmo_handle = ZX_HANDLE_INVALID;
+    }
+    if (buffer->phys_list && io_default_bti != ZX_HANDLE_INVALID) {
+        zx_status_t status = zx_bti_unpin(io_default_bti, buffer->phys_list[0]);
+        ZX_DEBUG_ASSERT(status == ZX_OK);
     }
     free(buffer->phys_list);
     buffer->phys_list = NULL;
@@ -227,4 +249,9 @@ zx_status_t io_buffer_physmap(io_buffer_t* buffer) {
     buffer->phys_list = paddrs;
     buffer->phys_count = pages;
     return ZX_OK;
+}
+
+void io_buffer_set_default_bti(zx_handle_t bti) {
+    ZX_DEBUG_ASSERT(io_default_bti == ZX_HANDLE_INVALID);
+    io_default_bti = bti;
 }
