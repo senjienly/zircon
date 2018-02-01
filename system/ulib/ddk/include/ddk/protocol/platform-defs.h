@@ -18,6 +18,7 @@ __BEGIN_CDECLS;
 #define PDEV_DID_USB_DWC2           5   // DWC2 USB Controller
 #define PDEV_DID_RTC_PL031          6   // ARM Primecell PL031 RTC
 #define PDEV_DID_DSI                7   // DSI
+#define PDEV_DID_BT_UART            8   // Bluetooth HCI over UART
 
 // QEMU emulator
 #define PDEV_VID_QEMU               1
