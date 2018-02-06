@@ -41,9 +41,26 @@ static int uart_test_thread(void *arg) {
     uart_test_t* test = arg;
 
     while (!test->done) {
-        const char* hi_there = "Hi there!\n";
-        zx_socket_write(test->socket, 0, hi_there, strlen(hi_there), NULL);
-        sleep(1);
+        char buffer[100];
+        size_t actual;
+        zx_status_t status = zx_socket_read(test->socket, 0, buffer, sizeof(buffer), &actual);
+        if (status == ZX_ERR_SHOULD_WAIT) {        
+            zx_signals_t observed;
+            zx_object_wait_one(test->socket, ZX_SOCKET_READABLE, ZX_TIME_INFINITE /*zx_deadline_after(ZX_SEC(10)) */, &observed);
+            if (observed & ZX_SOCKET_READABLE) {
+                continue;
+            }
+            // more to do here
+        } else if (status != ZX_OK) {
+            zxlogf(ERROR, "uart_test_thread zx_socket_read returned %d\n", status);
+            break;
+        }
+
+        const char* read_str = "Read: \"";
+        const char* read_str2 = "\"\n";
+        zx_socket_write(test->socket, 0, read_str, strlen(read_str), NULL);
+        zx_socket_write(test->socket, 0, buffer, actual, NULL);
+        zx_socket_write(test->socket, 0, read_str2, strlen(read_str2), NULL);
     }
 
     return 0;
