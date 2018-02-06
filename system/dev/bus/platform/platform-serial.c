@@ -4,7 +4,6 @@
 
 #include <ddk/debug.h>
 #include <ddk/protocol/serial.h>
-#include <sync/completion.h>
 #include <zircon/threads.h>
 #include <stdlib.h>
 #include <threads.h>
@@ -15,107 +14,115 @@ typedef struct serial_port {
     serial_driver_protocol_t serial;
     uint32_t port_num;
     zx_handle_t socket;
-    thrd_t in_thread;
-    thrd_t out_thread;
-    completion_t readable;
-    completion_t writeable;
+    zx_handle_t event;
+    thrd_t thread;
     mtx_t lock;
 } serial_port_t;
 
 enum {
-    WAIT_SOCKET,
-    WAIT_EVENT,
+    WAIT_ITEM_SOCKET,
+    WAIT_ITEM_EVENT,
 };
 
 #define UART_BUFFER_SIZE    1024
 
-static int serial_in_thread(void* arg) {
+#define EVENT_READABLE_SIGNAL ZX_USER_SIGNAL_0
+#define EVENT_WRITABLE_SIGNAL ZX_USER_SIGNAL_1
+#define EVENT_CANCEL_SIGNAL ZX_USER_SIGNAL_2
+#define EVENT_SIGNAL_MASK (EVENT_READABLE_SIGNAL | EVENT_WRITABLE_SIGNAL | EVENT_CANCEL_SIGNAL)
+
+static int platform_serial_thread(void* arg) {
     serial_port_t* port = arg;
-    uint8_t buffer[UART_BUFFER_SIZE];
+    uint8_t in_buffer[UART_BUFFER_SIZE];
+    uint8_t out_buffer[UART_BUFFER_SIZE];
+    size_t in_buffer_offset = 0;    // offset of first byte in in_buffer (if any)
+    size_t out_buffer_offset = 0;   // offset of first byte in out_buffer (if any)
+    size_t in_buffer_count = 0;     // number of bytes in in_buffer
+    size_t out_buffer_count = 0;    // number of bytes in out_buffer
+    zx_wait_item_t items[2];
+
+    items[WAIT_ITEM_SOCKET].handle = port->socket;
+    items[WAIT_ITEM_EVENT].handle = port->event;
 
     while (1) {
-// make sure we unblock this when shutting down
-        completion_wait(&port->readable, ZX_TIME_INFINITE);
-        size_t length;
-        zx_status_t status = serial_driver_read(&port->serial, port->port_num, buffer,
-                                                sizeof(buffer), &length);
-        if (status == ZX_ERR_SHOULD_WAIT) {
-            zxlogf(ERROR, "serial_in_thread: ZX_ERR_SHOULD_WAIT\n");
-        } else if (status != ZX_OK) {
-            zxlogf(ERROR, "serial_in_thread: serial_driver_read returned %d\n", status);
+        // attempt pending socket write
+        if (in_buffer_count > 0) {
+            size_t actual;
+            zx_status_t status = zx_socket_write(port->socket, 0, in_buffer + in_buffer_offset, in_buffer_count, &actual);
+            if (status == ZX_OK) {
+                in_buffer_count -= actual;
+                if (in_buffer_count > 0) {
+                    in_buffer_offset += actual;
+                } else {
+                    in_buffer_offset = 0;
+                }
+            } else if (status != ZX_ERR_SHOULD_WAIT) {
+                zxlogf(ERROR, "platform_serial_thread: zx_socket_write returned %d\n", status);
+                break;
+            }
+        }
+
+        // attempt pending serial write
+        if (out_buffer_count > 0) {
+            size_t actual;
+            zx_status_t status = serial_driver_write(&port->serial, port->port_num, out_buffer + out_buffer_offset, out_buffer_count, &actual);
+            if (status == ZX_OK) {
+                out_buffer_count -= actual;
+                if (out_buffer_count > 0) {
+                    out_buffer_offset += actual;
+                } else {
+                    out_buffer_offset = 0;
+                }
+            } else if (status != ZX_ERR_SHOULD_WAIT) {
+                zxlogf(ERROR, "platform_serial_thread: serial_driver_write returned %d\n", status);
+                break;
+            }
+        }
+
+        // wait for serial or socket readable
+        items[WAIT_ITEM_SOCKET].waitfor = ZX_SOCKET_READABLE | ZX_SOCKET_PEER_CLOSED;
+        items[WAIT_ITEM_EVENT].waitfor = EVENT_READABLE_SIGNAL | EVENT_CANCEL_SIGNAL;
+        // also wait for writability if we have pending data to write
+        if (in_buffer_count > 0) {
+            items[WAIT_ITEM_SOCKET].waitfor |= ZX_SOCKET_WRITABLE;
+        }
+        if (out_buffer_count > 0) {
+            items[WAIT_ITEM_EVENT].waitfor |= EVENT_WRITABLE_SIGNAL;
+        }
+
+        zx_status_t status = zx_object_wait_many(items, countof(items), ZX_TIME_INFINITE);
+        if (status != ZX_OK) {
+            zxlogf(ERROR, "platform_serial_thread: zx_object_wait_many returned %d\n", status);
             break;
         }
 
-        uint8_t* bufptr = buffer;
-        while (length > 0) {
-            size_t actual;
-            zx_status_t status = zx_socket_write(port->socket, 0, bufptr, length, &actual);
+        if (items[WAIT_ITEM_EVENT].pending & EVENT_READABLE_SIGNAL) {
+            size_t length;
+            status = serial_driver_read(&port->serial, port->port_num, in_buffer + in_buffer_count,
+                                        sizeof(in_buffer) - in_buffer_count, &length);
             if (status == ZX_ERR_SHOULD_WAIT) {
-                zx_signals_t observed;
-                status = zx_object_wait_one(port->socket, ZX_SOCKET_WRITABLE | ZX_SOCKET_PEER_CLOSED, 
-                                            ZX_TIME_INFINITE, &observed);
-                if (status != ZX_OK) {
-                    zxlogf(ERROR, "serial_in_thread: zx_object_wait_one returned %d\n", status);
-                    break;
-                }
-                if (observed & ZX_SOCKET_PEER_CLOSED) {
-// set a flag somewhere too? or close handle?
-                    break;
-                }
-                if (observed & ZX_SOCKET_WRITABLE) {
-                    continue;
-                }
+//                zxlogf(ERROR, "platform_serial_thread: ZX_ERR_SHOULD_WAIT\n");
             } else if (status != ZX_OK) {
-                zxlogf(ERROR, "serial_in_thread: zx_socket_read returned %d\n", status);
+                zxlogf(ERROR, "platform_serial_thread: serial_driver_read returned %d\n", status);
                 break;
             }
-
-            bufptr += actual;
-            length -= actual;
+            in_buffer_count += length;
         }
-    }
-
-    return 0;
-}
-
-static int serial_out_thread(void* arg) {
-    serial_port_t* port = arg;
-    uint8_t buffer[UART_BUFFER_SIZE];
-
-    while (1) {
-        zx_signals_t observed;
-        zx_status_t status = zx_object_wait_one(port->socket,
-                                                ZX_SOCKET_READABLE | ZX_SOCKET_PEER_CLOSED, 
-                                                ZX_TIME_INFINITE, &observed);
-        if (observed & ZX_SOCKET_READABLE) {
+        if (items[WAIT_ITEM_SOCKET].pending & ZX_SOCKET_READABLE) {
             size_t length;
-            status = zx_socket_read(port->socket, 0, buffer, sizeof(buffer), &length);
+            status = zx_socket_read(port->socket, 0, out_buffer + out_buffer_count, sizeof(out_buffer) - out_buffer_count, &length);
             if (status != ZX_OK) {
                 zxlogf(ERROR, "serial_out_thread: zx_socket_read returned %d\n", status);
                 break;
             }
+            out_buffer_count += length;
+        }
 
-            uint8_t* bufptr = buffer;
-            while (length > 0) {
-// make sure we unblock this when shutting down
-                completion_wait(&port->writeable, ZX_TIME_INFINITE);
-                size_t actual;
-                zx_status_t status = serial_driver_write(&port->serial, port->port_num, bufptr,
-                                                         length, &actual);
-                if (status == ZX_ERR_SHOULD_WAIT) {
-                    continue;
-                } else if (status != ZX_OK) {
-                    zxlogf(ERROR, "serial_out_thread: serial_driver_write returned %d\n", status);
-                    return -1;
-                }
-                bufptr += actual;
-                length -= actual;
-            }
+        if (items[WAIT_ITEM_EVENT].pending & EVENT_WRITABLE_SIGNAL) {
         }
-        if (observed & ZX_SOCKET_PEER_CLOSED) {
-// set a flag somewhere too? or close handle?
-            break;
+        if (items[WAIT_ITEM_SOCKET].pending & ZX_SOCKET_WRITABLE) {
         }
+
     }
 
     return 0;
@@ -124,16 +131,20 @@ static int serial_out_thread(void* arg) {
 static void platform_serial_state_cb(uint32_t port_num, uint32_t state, void* cookie) {
     serial_port_t* port = cookie;
 
+    zx_signals_t set = 0;
+    zx_signals_t clear = 0;
     if (state & SERIAL_STATE_READABLE) {
-        completion_signal(&port->readable);
+        set |= EVENT_READABLE_SIGNAL;
     } else {
-        completion_reset(&port->readable);
+        clear |= EVENT_READABLE_SIGNAL;
     }
     if (state & SERIAL_STATE_WRITABLE) {
-        completion_signal(&port->writeable);
+        set |= EVENT_WRITABLE_SIGNAL;
     } else {
-        completion_reset(&port->writeable);
+        clear |= EVENT_WRITABLE_SIGNAL;
     }
+
+    zx_object_signal(port->event, clear, set);
 }
 
 zx_status_t platform_serial_init(platform_bus_t* bus, serial_driver_protocol_t* serial) {
@@ -202,28 +213,36 @@ zx_status_t platform_serial_open_socket(platform_bus_t* bus, uint32_t port_num,
         goto fail;
     }
 
+    status = zx_event_create(0, &port->event);
+    if (status != ZX_OK) {
+        goto fail;
+    }
+
     serial_driver_set_notify_callback(&bus->serial, port_num, platform_serial_state_cb, port);
 // unregister on socket close?
 
-    int thrd_rc = thrd_create_with_name(&port->in_thread, serial_in_thread, port,
-                                        "serial_in_thread");
+    int thrd_rc = thrd_create_with_name(&port->thread, platform_serial_thread, port,
+                                        "platform_serial_thread");
     if (thrd_rc != thrd_success) {
         status = thrd_status_to_zx_status(thrd_rc);
         goto fail;
     }
+
+/*
     thrd_rc = thrd_create_with_name(&port->out_thread, serial_out_thread, port,
                                    "serial_out_thread");
     if (thrd_rc != thrd_success) {
         status = thrd_status_to_zx_status(thrd_rc);
         goto fail;
     }
+*/
 
     *out_handle = socket;
     mtx_unlock(&port->lock);
     return ZX_OK;
 
 fail:
-// TODO join thread?
+    zx_handle_close(port->event);
     zx_handle_close(port->socket);
     zx_handle_close(socket);
     port->socket = ZX_HANDLE_INVALID;
