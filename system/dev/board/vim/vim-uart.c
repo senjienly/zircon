@@ -13,11 +13,13 @@
 #include "vim.h"
 
 static const pbus_mmio_t uart_mmios[] = {
+#if BLUETOOTH
     // UART_A, for BT HCI
     {
         .base = 0xc1102130,
         .length = 0x18,
     },
+#endif
     // UART_AO_B, on 40 pin header
     {
         .base = 0xc81004e0,
@@ -26,11 +28,13 @@ static const pbus_mmio_t uart_mmios[] = {
 };
 
 static const pbus_irq_t uart_irqs[] = {
+#if BLUETOOTH
     // UART_A, for BT HCI
     {
         .irq = 58,
         .mode = ZX_INTERRUPT_MODE_EDGE_HIGH,
     },
+#endif
     // UART_AO_B, on 40 pin header
     {
         .irq = 229,
@@ -49,6 +53,7 @@ static pbus_dev_t uart_dev = {
     .irq_count = countof(uart_irqs),
 };
 
+#if BLUETOOTH
 const pbus_uart_t bt_uarts[] = {
     {
         .port = 0,
@@ -63,10 +68,15 @@ static const pbus_dev_t bt_uart_dev = {
     .uarts = bt_uarts,
     .uart_count = countof(bt_uarts),
 };
+#endif
 
 const pbus_uart_t uart_test_uarts[] = {
     {
+#if BLUETOOTH
         .port = 1,
+#else
+        .port = 0,
+#endif
     },
 };
 
@@ -106,11 +116,13 @@ zx_status_t vim_uart_init(vim_bus_t* bus) {
         return status;
     }
 
+#if BLUETOOTH
     status = pbus_device_add(&bus->pbus, &bt_uart_dev, 0);
     if (status != ZX_OK) {
         zxlogf(ERROR, "vim_gpio_init: pbus_device_add failed: %d\n", status);
         return status;
     }
+#endif
     status = pbus_device_add(&bus->pbus, &uart_test_dev, 0);
     if (status != ZX_OK) {
         zxlogf(ERROR, "vim_gpio_init: pbus_device_add failed: %d\n", status);
