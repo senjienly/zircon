@@ -11,7 +11,24 @@ __BEGIN_CDECLS;
 
 // flags for serial_config()
 enum {
-    SERIAL_FLOW_CONTROL = (1 << 0), // enables hardware flow control
+    SERIAL_DATA_BITS_5 = (0 << 0),
+    SERIAL_DATA_BITS_6 = (1 << 0),
+    SERIAL_DATA_BITS_7 = (2 << 0),
+    SERIAL_DATA_BITS_8 = (3 << 0),
+    SERIAL_DATA_BITS_MASK = (3 << 0),
+
+    SERIAL_STOP_BITS_1 = (0 << 2),
+    SERIAL_STOP_BITS_2 = (1 << 2),
+    SERIAL_STOP_BITS_MASK = (1 << 2),
+
+    SERIAL_PARITY_NONE  = (0 << 3),
+    SERIAL_PARITY_EVEN  = (1 << 3),
+    SERIAL_PARITY_ODD  = (2 << 3),
+    SERIAL_PARITY_MASK  = (3 << 3),
+
+    SERIAL_FLOW_CTRL_NONE = (0 << 4),
+    SERIAL_FLOW_CTRL_CTS_RTS = (1 << 4),
+    SERIAL_FLOW_CTRL_MASK = (1 << 4),
 };
 
 // High level serial protocol for use by client drivers
@@ -56,6 +73,7 @@ typedef void (*serial_state_cb)(uint32_t port_num, uint32_t state, void* cookie)
 typedef struct {
     uint32_t (*get_port_count)(void* ctx);
     zx_status_t (*config)(void* ctx, uint32_t port_num, uint32_t baud_rate, uint32_t flags);
+    zx_status_t (*enable)(void* ctx, uint32_t port_num, bool enable);
     zx_status_t (*read)(void* ctx, uint32_t port_num, void* buf, size_t length, size_t* out_actual);
     zx_status_t (*write)(void* ctx, uint32_t port_num, const void* buf, size_t length,
                          size_t* out_actual);
@@ -76,6 +94,12 @@ static inline uint32_t serial_driver_get_port_count(serial_driver_protocol_t* se
 static inline zx_status_t serial_driver_config(serial_driver_protocol_t* serial, uint32_t port_num,
                                                uint32_t baud_rate, uint32_t flags) {
     return serial->ops->config(serial->ctx, port_num, baud_rate, flags);
+}
+
+// enables or disables the given serial port
+static inline zx_status_t serial_driver_enable(serial_driver_protocol_t* serial, uint32_t port_num,
+                                               bool enable) {
+    return serial->ops->enable(serial->ctx, port_num, enable);
 }
 
 // reads data from the given serial port

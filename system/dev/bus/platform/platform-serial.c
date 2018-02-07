@@ -185,13 +185,9 @@ zx_status_t platform_serial_config(platform_bus_t* bus, uint32_t port_num, uint3
     if (port_num >= bus->serial_port_count) {
         return ZX_ERR_NOT_FOUND;
     }
-    serial_port_t* port = &bus->serial_ports[port_num];
 
-    mtx_lock(&port->lock);
-
-    mtx_unlock(&port->lock);
-
-    return ZX_OK;
+// locking? flushing?
+    return serial_driver_config(&bus->serial, port_num, baud_rate, flags);
 }
 
 zx_status_t platform_serial_open_socket(platform_bus_t* bus, uint32_t port_num,
@@ -218,6 +214,11 @@ zx_status_t platform_serial_open_socket(platform_bus_t* bus, uint32_t port_num,
         goto fail;
     }
 
+    status = serial_driver_enable(&bus->serial, port_num, true);
+    if (status != ZX_OK) {
+        goto fail;
+    }
+
     serial_driver_set_notify_callback(&bus->serial, port_num, platform_serial_state_cb, port);
 // unregister on socket close?
 
@@ -227,15 +228,6 @@ zx_status_t platform_serial_open_socket(platform_bus_t* bus, uint32_t port_num,
         status = thrd_status_to_zx_status(thrd_rc);
         goto fail;
     }
-
-/*
-    thrd_rc = thrd_create_with_name(&port->out_thread, serial_out_thread, port,
-                                   "serial_out_thread");
-    if (thrd_rc != thrd_success) {
-        status = thrd_status_to_zx_status(thrd_rc);
-        goto fail;
-    }
-*/
 
     *out_handle = socket;
     mtx_unlock(&port->lock);

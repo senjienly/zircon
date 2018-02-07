@@ -12,31 +12,36 @@
 
 #include "vim.h"
 
+#define HEADER_UART 1
 #define BLUETOOTH 1
 
 #define BT_EN S912_GPIOX(17)
 
 static const pbus_mmio_t uart_mmios[] = {
+#if HEADER_UART
     // UART_AO_B, on 40 pin header
     {
         .base = 0xc81004e0,
         .length = 0x18,
     },
+#endif
 #if BLUETOOTH
     // UART_A, for BT HCI
     {
-        .base = 0xc1102130,
+        .base = 0xc11084c0,
         .length = 0x18,
     },
 #endif
 };
 
 static const pbus_irq_t uart_irqs[] = {
+#if HEADER_UART
     // UART_AO_B, on 40 pin header
     {
         .irq = 229,
         .mode = ZX_INTERRUPT_MODE_EDGE_HIGH,
     },
+#endif
 #if BLUETOOTH
     // UART_A, for BT HCI
     {
@@ -58,6 +63,7 @@ static pbus_dev_t uart_dev = {
 };
 
 
+#if HEADER_UART
 const pbus_uart_t uart_test_uarts[] = {
     {
         .port = 0,
@@ -72,11 +78,16 @@ static pbus_dev_t uart_test_dev = {
     .uarts = uart_test_uarts,
     .uart_count = countof(uart_test_uarts),
 };
+#endif
 
 #if BLUETOOTH
 const pbus_uart_t bt_uarts[] = {
     {
+#if HEADER_UART
+        .port = 1,
+#else
         .port = 0,
+#endif
     },
 };
 
@@ -117,18 +128,20 @@ zx_status_t vim_uart_init(vim_bus_t* bus) {
         return status;
     }
 
-    serial_driver_config(&bus->serial, 0, 115200, 0);
+#if HEADER_UART
     status = pbus_device_add(&bus->pbus, &uart_test_dev, 0);
     if (status != ZX_OK) {
         zxlogf(ERROR, "vim_gpio_init: pbus_device_add failed: %d\n", status);
         return status;
     }
+#endif
 
 #if BLUETOOTH
     gpio_set_alt_function(&bus->gpio, BT_EN, 1);
     gpio_write(&bus->gpio, BT_EN, 1);
 
-    serial_driver_config(&bus->serial, 1, 1234567, SERIAL_FLOW_CONTROL);
+    serial_driver_config(&bus->serial, 1, 115200,
+            SERIAL_DATA_BITS_8 | SERIAL_STOP_BITS_1 | SERIAL_PARITY_NONE | SERIAL_FLOW_CTRL_CTS_RTS);
     status = pbus_device_add(&bus->pbus, &bt_uart_dev, 0);
     if (status != ZX_OK) {
         zxlogf(ERROR, "vim_gpio_init: pbus_device_add failed: %d\n", status);

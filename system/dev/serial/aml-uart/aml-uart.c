@@ -17,31 +17,37 @@
 #include <soc/aml-common/aml-uart.h>
 
 #include <zircon/assert.h>
+#include <zircon/threads.h>
 #include <zircon/types.h>
 
+// crystal clock speed
 #define CLK_XTAL    24000000
 
+#define DEFAULT_BAUD_RATE   115200
+#define DEFAULT_CONFIG      (SERIAL_DATA_BITS_8 | SERIAL_STOP_BITS_1 | SERIAL_PARITY_NONE)
+
 typedef struct {
+    struct aml_uart* uart;
     uint32_t port_num;
     pdev_vmo_buffer_t mmio;
     zx_handle_t irq_handle;
     thrd_t irq_thread;
     serial_state_cb notify_cb;
     void* cookie;
-    // last state we sent to notify_cb
-    uint32_t state;
+    uint32_t state; // last state we sent to notify_cb
     mtx_t lock;
+    bool enabled;
 } aml_uart_port_t;
 
-typedef struct {
+typedef struct aml_uart {
+    platform_device_protocol_t pdev;
     serial_driver_protocol_t serial;
     zx_device_t* zxdev;
     aml_uart_port_t* ports;
     unsigned port_count;
 } aml_uart_t;
 
-
-static uint32_t read_state(aml_uart_port_t* port) {
+static uint32_t aml_uart_read_state(aml_uart_port_t* port) {
     void* mmio = port->mmio.vaddr;
     volatile uint32_t* status_reg = mmio + AML_UART_STATUS;
     uint32_t status = readl(status_reg);
@@ -67,6 +73,55 @@ static uint32_t read_state(aml_uart_port_t* port) {
     return state;
 }
 
+static int aml_uart_irq_thread(void *arg) {
+    zxlogf(INFO, "aml_uart_irq_thread start\n");
+
+    aml_uart_port_t* port = arg;
+    void* mmio = port->mmio.vaddr;
+    volatile uint32_t* ctrl_reg = mmio + AML_UART_CONTROL;
+    volatile uint32_t* irq_ctrl_reg = mmio + AML_UART_IRQ_CONTROL;
+
+    // reset the port
+    uint32_t temp = readl(ctrl_reg);
+    temp |= AML_UART_CONTROL_RSTRX | AML_UART_CONTROL_RSTTX | AML_UART_CONTROL_CLRERR;
+    writel(temp, ctrl_reg);
+    temp &= ~(AML_UART_CONTROL_RSTRX | AML_UART_CONTROL_RSTTX | AML_UART_CONTROL_CLRERR);
+    writel(temp, ctrl_reg);
+
+    // enable rx and tx
+    temp |= AML_UART_CONTROL_TXEN | AML_UART_CONTROL_RXEN;
+    // XMITLEN zero for 8 bits, PAREN zero for no parity, STOPLEN zero for 1 stop bit
+    temp &= ~(AML_UART_CONTROL_XMITLEN_MASK | AML_UART_CONTROL_PAR_MASK | AML_UART_CONTROL_STOPLEN_MASK);
+    temp |= AML_UART_CONTROL_INVRTS | AML_UART_CONTROL_TXINTEN | AML_UART_CONTROL_RXINTEN | AML_UART_CONTROL_TWOWIRE;
+    writel(temp, ctrl_reg);
+
+    // Set to interrupt every 1 tx and rx byte
+// FIXME use defines
+    temp = readl(irq_ctrl_reg);
+    temp &= 0xffff0000;
+    temp |= (1 << 8) | ( 1 );
+    writel(temp, irq_ctrl_reg);
+
+    while (1) {
+        uint64_t slots;
+        zx_status_t result = zx_interrupt_wait(port->irq_handle, &slots);
+        if (result != ZX_OK) {
+            zxlogf(ERROR, "aml_uart_irq_thread: zx_interrupt_wait got %d\n", result);
+            break;
+        }
+
+        aml_uart_read_state(port);
+    }
+
+    // disable TX/RX on the way out
+    temp = readl(ctrl_reg);
+    temp &= ~(AML_UART_CONTROL_TXEN | AML_UART_CONTROL_RXEN);
+    writel(temp, ctrl_reg);
+
+    zxlogf(INFO, "aml_uart_irq_thread done\n");
+
+    return 0;
+}
 
 static uint32_t aml_serial_get_port_count(void* ctx) {
     aml_uart_t* uart = ctx;
@@ -78,8 +133,125 @@ static zx_status_t aml_serial_config(void* ctx, uint32_t port_num, uint32_t baud
     if (port_num >= uart->port_count) {
         return ZX_ERR_INVALID_ARGS;
     }
-//    aml_uart_port_t* uart_port = &uart->ports[port_num];
-return ZX_OK;    
+    aml_uart_port_t* port = &uart->ports[port_num];
+    void* mmio = port->mmio.vaddr;
+    volatile uint32_t* ctrl_reg = mmio + AML_UART_CONTROL;
+    volatile uint32_t* reg5 = mmio + AML_UART_REG5;
+
+    uint32_t config_bits = 0;
+    const uint32_t config_mask = AML_UART_CONTROL_XMITLEN_MASK |
+                                 AML_UART_CONTROL_STOPLEN_MASK |
+                                 AML_UART_CONTROL_PAR_MASK |
+                                 AML_UART_CONTROL_TWOWIRE;
+
+    switch (flags & SERIAL_DATA_BITS_MASK) {
+    case SERIAL_DATA_BITS_5:
+        config_bits |= AML_UART_CONTROL_XMITLEN_5;
+        break;
+    case SERIAL_DATA_BITS_6:
+        config_bits |= AML_UART_CONTROL_XMITLEN_6;
+        break;
+    case SERIAL_DATA_BITS_7:
+        config_bits |= AML_UART_CONTROL_XMITLEN_7;
+        break;
+    case SERIAL_DATA_BITS_8:
+        config_bits |= AML_UART_CONTROL_XMITLEN_8;
+        break;
+    default:
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    switch (flags & SERIAL_STOP_BITS_MASK) {
+    case SERIAL_STOP_BITS_1:
+        config_bits |= AML_UART_CONTROL_STOPLEN_1;
+        break;
+    case SERIAL_STOP_BITS_2:
+        config_bits |= AML_UART_CONTROL_STOPLEN_2;
+        break;
+    default:
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    switch (flags & SERIAL_PARITY_MASK) {
+    case SERIAL_PARITY_NONE:
+        config_bits |= AML_UART_CONTROL_PAR_NONE;
+        break;
+    case SERIAL_PARITY_EVEN:
+        config_bits |= AML_UART_CONTROL_PAR_EVEN;
+        break;
+    case SERIAL_PARITY_ODD:
+        config_bits |= AML_UART_CONTROL_PAR_ODD;
+        break;
+    default:
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    switch (flags & SERIAL_FLOW_CTRL_MASK) {
+    case SERIAL_FLOW_CTRL_NONE:
+        config_bits |= AML_UART_CONTROL_TWOWIRE;
+    case SERIAL_FLOW_CTRL_CTS_RTS:
+        break;
+    default:
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    uint32_t baud_bits = (CLK_XTAL / 3) / baud_rate - 1;
+    if (baud_bits & ~AML_UART_REG5_NEW_BAUD_RATE_MASK) {
+        zxlogf(ERROR, "aml_serial_config: baud rate %u too large\n", baud_rate);
+        return ZX_ERR_OUT_OF_RANGE;
+    }
+
+    mtx_lock(&port->lock);
+
+    uint32_t temp = readl(ctrl_reg);
+    temp &= ~config_mask;
+    temp |= config_bits;
+    writel(temp, ctrl_reg);
+
+    temp = baud_bits | AML_UART_REG5_USE_XTAL_CLK | AML_UART_REG5_USE_NEW_BAUD_RATE;
+    writel(temp, reg5);
+
+    mtx_unlock(&port->lock);
+
+    return ZX_OK;
+}
+
+static zx_status_t aml_serial_enable(void* ctx, uint32_t port_num, bool enable) {
+    aml_uart_t* uart = ctx;
+    if (port_num >= uart->port_count) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+    aml_uart_port_t* port = &uart->ports[port_num];
+
+    mtx_lock(&port->lock);
+
+    if (enable && !port->enabled) {
+        zx_status_t status = pdev_map_interrupt(&port->uart->pdev, port_num, &port->irq_handle);
+        if (status != ZX_OK) {
+            zxlogf(ERROR, "aml_serial_enable: pdev_map_interrupt failed %d\n", status);
+            mtx_unlock(&port->lock);
+            return status;
+        }
+
+        int rc = thrd_create_with_name(&port->irq_thread, aml_uart_irq_thread, port,
+                                       "aml_uart_irq_thread");
+        if (rc != thrd_success) {
+            zx_handle_close(port->irq_handle);
+            port->irq_handle = ZX_HANDLE_INVALID;
+            mtx_unlock(&port->lock);
+            return thrd_status_to_zx_status(rc);
+        }
+    } else if (!enable && port->enabled) {
+        zx_interrupt_signal(port->irq_handle, ZX_INTERRUPT_SLOT_USER, 0);
+        thrd_join(port->irq_thread, NULL);
+        zx_handle_close(port->irq_handle);
+        port->irq_handle = ZX_HANDLE_INVALID;
+    }
+
+    port->enabled = enable;
+    mtx_unlock(&port->lock);
+
+    return ZX_OK;
 }
 
 static zx_status_t aml_serial_read(void* ctx, uint32_t port_num, void* buf, size_t length,
@@ -97,7 +269,7 @@ static zx_status_t aml_serial_read(void* ctx, uint32_t port_num, void* buf, size
     uint8_t* end = bufptr + length;
 // need to lock around reading status to avoid problems with aml_serial_write?
 
-    while (bufptr < end && (read_state(port) & SERIAL_STATE_READABLE)) {
+    while (bufptr < end && (aml_uart_read_state(port) & SERIAL_STATE_READABLE)) {
         uint32_t val = readl(rfifo_reg);
         *bufptr++ = val;
     }
@@ -124,7 +296,7 @@ static zx_status_t aml_serial_write(void* ctx, uint32_t port_num, const void* bu
 
     const uint8_t* bufptr = buf;
     const uint8_t* end = bufptr + length;
-    while (bufptr < end && (read_state(port) & SERIAL_STATE_WRITABLE)) {
+    while (bufptr < end && (aml_uart_read_state(port) & SERIAL_STATE_WRITABLE)) {
         writel(*bufptr++, wfifo_reg);
     }
 
@@ -148,7 +320,7 @@ static zx_status_t aml_serial_set_notify_callback(void* ctx, uint32_t port_num, 
     port->cookie = cookie;
 
     // this will trigger notifying current state
-    read_state(port);
+    aml_uart_read_state(port);
 
     return ZX_OK;
 }
@@ -156,6 +328,7 @@ static zx_status_t aml_serial_set_notify_callback(void* ctx, uint32_t port_num, 
 static serial_driver_ops_t aml_serial_ops = {
     .get_port_count = aml_serial_get_port_count,
     .config = aml_serial_config,
+    .enable = aml_serial_enable,
     .read = aml_serial_read,
     .write = aml_serial_write,
     .set_notify_callback = aml_serial_set_notify_callback,
@@ -178,53 +351,6 @@ static zx_protocol_device_t uart_device_proto = {
     .release = aml_uart_release,
 };
 
-static int aml_uart_irq_thread(void *arg) {
-    aml_uart_port_t* port = arg;
-
-    void* mmio = port->mmio.vaddr;
-
-    volatile uint32_t* ctrl_reg = mmio + AML_UART_CONTROL;
-    volatile uint32_t* irq_ctrl_reg = mmio + AML_UART_IRQ_CONTROL;
-    volatile uint32_t* reg5 = mmio + AML_UART_REG5;
-
-    // reset the port
-    uint32_t temp = readl(ctrl_reg);
-    temp |= AML_UART_CONTROL_RSTRX | AML_UART_CONTROL_RSTTX | AML_UART_CONTROL_CLRERR;
-    writel(temp, ctrl_reg);
-    temp &= ~(AML_UART_CONTROL_RSTRX | AML_UART_CONTROL_RSTTX | AML_UART_CONTROL_CLRERR);
-    writel(temp, ctrl_reg);
-
-// configure baud rate and clock
-    writel(0x01800045, reg5);
-    
-    // enable rx and tx
-    temp |= AML_UART_CONTROL_TXEN | AML_UART_CONTROL_RXEN;
-    // XMITLEN zero for 8 bits, PAREN zero for no parity, STOPLEN zero for 1 stop bit
-    temp &= ~(AML_UART_CONTROL_XMITLEN_MASK | AML_UART_CONTROL_PAREN | AML_UART_CONTROL_STOPLEN_MASK);
-    temp |= AML_UART_CONTROL_INVRTS | AML_UART_CONTROL_TXINTEN | AML_UART_CONTROL_RXINTEN | AML_UART_CONTROL_TWOWIRE;
-    writel(temp, ctrl_reg);
-
-    // Set to interrupt every 1 tx and rx byte
-    temp = readl(irq_ctrl_reg);
-    temp &= 0xffff0000;
-    temp |= (1 << 8) | ( 1 );
-    writel(temp, irq_ctrl_reg);
-
-    while (1) {
-        uint64_t slots;
-        zx_status_t result = zx_interrupt_wait(port->irq_handle, &slots);
-        if (result != ZX_OK) {
-            zxlogf(ERROR, "aml_uart_irq_thread: zx_interrupt_wait got %d\n", result);
-            break;
-        }
-        
-        read_state(port);
-    }
-printf("aml_uart_irq_thread done\n");
-
-    return 0;
-}
-
 static zx_status_t aml_uart_bind(void* ctx, zx_device_t* parent) {
     zx_status_t status;
 
@@ -233,8 +359,7 @@ static zx_status_t aml_uart_bind(void* ctx, zx_device_t* parent) {
         return ZX_ERR_NO_MEMORY;
     }
 
-    platform_device_protocol_t pdev;
-    if ((status = device_get_protocol(parent, ZX_PROTOCOL_PLATFORM_DEV, &pdev)) != ZX_OK) {
+    if ((status = device_get_protocol(parent, ZX_PROTOCOL_PLATFORM_DEV, &uart->pdev)) != ZX_OK) {
         zxlogf(ERROR, "aml_uart_bind: ZX_PROTOCOL_PLATFORM_DEV not available\n");
         goto fail;
     }
@@ -246,7 +371,7 @@ static zx_status_t aml_uart_bind(void* ctx, zx_device_t* parent) {
     }
 
     pdev_device_info_t info;
-    status = pdev_get_device_info(&pdev, &info);
+    status = pdev_get_device_info(&uart->pdev, &info);
     if (status != ZX_OK) {
         zxlogf(ERROR, "aml_uart_bind: pdev_get_device_info failed\n");
         goto fail;
@@ -269,24 +394,17 @@ static zx_status_t aml_uart_bind(void* ctx, zx_device_t* parent) {
 
     for (unsigned i = 0; i < port_count; i++) {
         aml_uart_port_t* port = &ports[i];
+        port->uart = uart;
         mtx_init(&port->lock, mtx_plain);
         port->port_num = i;
 
-        status = pdev_map_mmio_buffer(&pdev, i, ZX_CACHE_POLICY_UNCACHED_DEVICE, &port->mmio);
+        status = pdev_map_mmio_buffer(&uart->pdev, i, ZX_CACHE_POLICY_UNCACHED_DEVICE, &port->mmio);
         if (status != ZX_OK) {
             zxlogf(ERROR, "aml_uart_bind: pdev_map_mmio_buffer failed %d\n", status);
             goto fail;
         }
-        status = pdev_map_interrupt(&pdev, i, &port->irq_handle);
-        if (status != ZX_OK) {
-            zxlogf(ERROR, "aml_uart_bind: pdev_map_interrupt failed %d\n", status);
-            goto fail;
-        }
-        int rc = thrd_create_with_name(&port->irq_thread, aml_uart_irq_thread, port,
-                                       "aml_uart_irq_thread");
-         if (rc != ZX_OK) {
-            goto fail;
-        }
+
+        aml_serial_config(uart, i, DEFAULT_BAUD_RATE, DEFAULT_CONFIG);
    }
 
     device_add_args_t args = {
