@@ -26,9 +26,9 @@ enum {
     SERIAL_PARITY_ODD  = (2 << 3),
     SERIAL_PARITY_MASK  = (3 << 3),
 
-    SERIAL_FLOW_CTRL_NONE = (0 << 4),
-    SERIAL_FLOW_CTRL_CTS_RTS = (1 << 4),
-    SERIAL_FLOW_CTRL_MASK = (1 << 4),
+    SERIAL_FLOW_CTRL_NONE = (0 << 5),
+    SERIAL_FLOW_CTRL_CTS_RTS = (1 << 5),
+    SERIAL_FLOW_CTRL_MASK = (1 << 5),
 };
 
 // High level serial protocol for use by client drivers

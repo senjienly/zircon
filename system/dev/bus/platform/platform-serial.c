@@ -117,18 +117,13 @@ static int platform_serial_thread(void* arg) {
             }
             out_buffer_count += length;
         }
-
-        if (items[WAIT_ITEM_EVENT].pending & EVENT_WRITABLE_SIGNAL) {
-        }
-        if (items[WAIT_ITEM_SOCKET].pending & ZX_SOCKET_WRITABLE) {
-        }
-
     }
 
     return 0;
 }
 
 static void platform_serial_state_cb(uint32_t port_num, uint32_t state, void* cookie) {
+printf("platform_serial_state_cb port %u: %u\n", port_num, state);
     serial_port_t* port = cookie;
 
     zx_signals_t set = 0;

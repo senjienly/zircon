@@ -15,6 +15,7 @@
 #define HEADER_UART 1
 #define BLUETOOTH 1
 
+#define WIFI_PWREN S912_GPIOX(6)
 #define BT_EN S912_GPIOX(17)
 
 static const pbus_mmio_t uart_mmios[] = {
@@ -138,10 +139,17 @@ zx_status_t vim_uart_init(vim_bus_t* bus) {
 
 #if BLUETOOTH
     gpio_set_alt_function(&bus->gpio, BT_EN, 1);
+    gpio_set_alt_function(&bus->gpio, WIFI_PWREN, 1);
+    gpio_write(&bus->gpio, BT_EN, 0);
+    gpio_write(&bus->gpio, WIFI_PWREN, 0);
+// FIXME don't block here
+    zx_nanosleep(zx_deadline_after(ZX_MSEC(200)));
     gpio_write(&bus->gpio, BT_EN, 1);
+    gpio_write(&bus->gpio, WIFI_PWREN, 1);
+    zx_nanosleep(zx_deadline_after(ZX_MSEC(200)));
 
-    serial_driver_config(&bus->serial, 1, 115200,
-            SERIAL_DATA_BITS_8 | SERIAL_STOP_BITS_1 | SERIAL_PARITY_NONE | SERIAL_FLOW_CTRL_CTS_RTS);
+    serial_driver_config(&bus->serial, 1, 115200, SERIAL_DATA_BITS_8 | SERIAL_STOP_BITS_1 |
+                                                  SERIAL_PARITY_NONE | SERIAL_FLOW_CTRL_CTS_RTS);
     status = pbus_device_add(&bus->pbus, &bt_uart_dev, 0);
     if (status != ZX_OK) {
         zxlogf(ERROR, "vim_gpio_init: pbus_device_add failed: %d\n", status);
